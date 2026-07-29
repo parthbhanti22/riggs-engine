@@ -97,3 +97,28 @@ type EnsembleResult struct {
 	// N is the number of trajectories that contributed to this result.
 	N int
 }
+
+// ScheduledEvent represents a deterministic event injected at a specific time
+// into the SSA simulation. Used for environmental triggers that fire on a
+// fixed external schedule rather than as stochastic reaction channels.
+//
+// In the hybrid SSA technique, the simulation loop compares the next stochastic
+// event time (τ) with the next scheduled event time. Whichever is sooner fires
+// first. This preserves the exactness of the SSA for stochastic channels while
+// correctly interleaving deterministic interventions.
+//
+// Idempotency: if a scheduled event would push a binary species above 1 (e.g.,
+// binding an already-bound complex), the delta is clamped so the species stays
+// at its maximum valid value (1 for binary states). This means redundant triggers
+// are no-ops.
+type ScheduledEvent struct {
+	// Time is the absolute simulation time at which this event fires.
+	Time float64
+
+	// Deltas is the state-change vector to apply, with the same semantics
+	// as Reaction.Deltas. Deltas[s] is the change to species s.
+	Deltas []int
+
+	// Tag is an opaque identifier for logging/debugging (e.g., which trigger fired).
+	Tag int
+}

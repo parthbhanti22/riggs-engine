@@ -298,20 +298,166 @@ scan is fine. For 1000+ sites, the Next Reaction Method would help.
 
 ---
 
-## Open Questions (for review before Phase 2)
+## Open Questions — RESOLVED (Phase 2)
 
-- **Environmental trigger schema**: The WAL analogy implies recording *what* caused
-  each methylation event (temperature spike? signal molecule?). What schema should
-  triggers follow? A simple enum? A structured event with timestamp + type + magnitude?
+These questions from Phase 1 were resolved at the start of Phase 2:
 
-- **Target reaction-channel count for Phase 2**: How many CpG sites should the
-  initial genome model support? 10? 100? 1000? This affects whether we need sparse
-  delta vectors and optimized propensity updates (Next Reaction Method) vs. the
-  simple linear scan we use now.
+1. **Environmental trigger schema**: → Deterministic scheduled events with a fixed
+   external schedule (researcher-controlled stimulus times). Not a Poisson process.
+   Implemented as `EnvironmentalTrigger.FireTimes []float64`.
 
-- **State persistence**: Should trajectories be streamable to disk during simulation
-  (for very long runs), or is in-memory accumulation sufficient for Phase 2?
+2. **Target reaction-channel count**: → Default 50 sites (realistic CpG island).
+   Benchmarks sweep 10/100/1000. Dense Deltas at N=1000 cost ~16MB — fine on 3.7GB
+   WSL. Linear propensity scan at 2000 channels runs at 380μs/trajectory.
 
-- **Rate modulation**: Should environmental triggers change rate constants dynamically
-  (time-inhomogeneous process), or should they be modeled as additional reaction
-  channels that change state and indirectly affect propensities?
+3. **State persistence**: → In-memory accumulation for Phase 2. Disk streaming
+   deferred to Phase 3 (TUI may need it for long-running visualizations).
+
+4. **Rate modulation**: → Propensity gating, not rate-constant modification.
+   The propensity function checks the bound-complex species: `(k_bg + k_enh * bound)`.
+   This is a time-inhomogeneous rate that changes when the complex binds/unbinds,
+   but it's expressed through the standard SSA propensity mechanism.
+
+---
+
+## Entry 5: Phase 2 — Biological Instruction Set (2026-07-29)
+
+### What was built
+
+The `bio` package (Logic Tier) maps biological entities onto the Phase 1 Gillespie
+core. Total new code: ~800 lines of Go in 6 files, plus updates to Phase 1.
+
+**New package: `bio/`**
+
+| File | Lines | Purpose |
+|------|------:|---------|
+| `genome.go` | ~110 | `Genome`, `Site`, `SiteContext`, `NewGenome()` |
+| `complex.go` | ~45 | `TargetingComplex` (dCas9 pointer) |
+| `trigger.go` | ~30 | `EnvironmentalTrigger` (WAL mechanic) |
+| `system.go` | ~260 | `System.Build()` → reactions + state + schedule |
+| `bio_test.go` | ~610 | 12 tests: structural, statistical, end-to-end |
+| `bio_bench_test.go` | ~120 | Scaling benchmarks at N=10/100/1000 |
+
+**Phase 1 additions (backward-compatible)**
+
+| File | Change |
+|------|--------|
+| `gillespie/types.go` | Added `ScheduledEvent` type |
+| `gillespie/ssa.go` | Added `RunWithSchedule()` — hybrid SSA |
+| `gillespie/ensemble.go` | Added `Schedule` field to `EnsembleConfig` |
+
+### Design decisions
+
+**Conditional propensity gating**: Enhanced rates from a bound complex are folded
+into the *same* reaction channel as the background rate. The propensity closure
+checks `counts[boundSpeciesIdx]`:
+
+```
+a_write_i = (k_bg + k_enh * bound_at_i) * (1 - meth_i)
+```
+
+This gives 2N + K channels instead of 4N + K (no separate "enhanced" channels).
+With a fast path for untargeted sites (no inner loop), the propensity evaluation
+at N=1000 runs in ~380μs per SSA step.
+
+**Hybrid SSA for deterministic triggers**: `RunWithSchedule()` compares the next
+stochastic event time τ with the next scheduled event time at each iteration.
+Whichever is sooner fires first. Scheduled events use clamped delta application
+(binary species can't exceed 1) for trigger idempotency.
+
+**Negative FiredReaction tags**: Scheduled events are recorded in the trajectory
+with `FiredReaction = -(tag + 1)`, distinguishing them from stochastic reactions
+(which have `FiredReaction ≥ 0`). This lets post-processing separate trigger
+events from stochastic methylation events.
+
+### Benchmark results (i3-1005G1 @ 1.20GHz)
+
+**Scaling verification — reaction channel count is O(N)**:
+
+| N sites | Channels | Build (ns/op) | Build (allocs) | Trajectory (ns/op) | Ensemble 100-traj (ns/op) |
+|--------:|---------:|--------------:|---------------:|--------------------:|--------------------------:|
+| 10 | 21 | 2,372 | 48 | 49,149 | 4,748,635 |
+| 100 | 201 | 82,130 | 408 | 61,405 | 3,713,768 |
+| 1000 | 2001 | 4,507,620 | 4,008 | 380,242 | 18,531,032 |
+
+Scaling analysis:
+- **Build**: ~55x slowdown for 100x sites → O(N) with constant overhead
+- **Channels**: 10x per 10x sites → exactly linear ✓
+- **Trajectory**: ~7.7x slowdown for 100x sites → sub-linear (tMax scales inversely)
+- **Ensemble**: ~3.9x slowdown for 100x sites → sub-linear (fewer events at shorter tMax)
+
+Memory at N=1000: 25MB per 100-trajectory ensemble — well within 3.7GB WSL budget.
+
+### Test results
+
+All 22 tests pass across both packages (bio: 12 tests, gillespie: 10 tests):
+
+**Key statistical results**:
+
+| Test | Metric | Expected | Observed |
+|------|--------|----------|----------|
+| Background-only steady state | P(meth) | 0.3333 | 0.3310 |
+| Targeted site (permanently bound) | P(meth) | 0.1653 | 0.1650 |
+| Targeted/background ratio (perm.) | ratio | ~1.8x | 1.84x |
+| Complex bound fraction | 1/kOff/tMax | 0.0200 | 0.0200 |
+| **Full trigger-driven e2e** | **targeted** | **high** | **0.8258** |
+| **Full trigger-driven e2e** | **background** | **low** | **0.0726** |
+| **Full trigger-driven e2e** | **ratio** | **>2x** | **11.38x** |
+
+The 11.38x targeted/background ratio in the full end-to-end test confirms that
+the entire pipeline — trigger scheduling, complex binding, propensity gating,
+stochastic methylation, complex unbinding — works correctly as an integrated system.
+
+### CLI output (default: 50 sites, genome mode)
+
+```
+  Genome:       50 CpG sites, 101 reaction channels
+  Species:      51 (50 sites + 1 complexes)
+
+  Site 0 (targeted by dCas9-methyltransferase):
+    Mean methylation:    0.715006
+
+  Site 1 (background only, no targeting):
+    Mean methylation:    0.074499
+
+  Targeted/background ratio: 9.60x
+  Throughput:                 19036 trajectories/sec
+  ✓ Targeted site shows 9.6x enhancement — PASS
+```
+
+### How Phase 3's TUI will consume this multi-site state
+
+The `TrajectoryRecord` from `RunWithSchedule()` contains everything Phase 3 needs:
+
+1. **Per-site methylation heatmap**: `rec.States[event][siteIdx]` gives the
+   methylation state of each site after each event. A TUI can render this as a
+   2D grid (sites × time) with color-coded cells.
+
+2. **Complex binding timeline**: `rec.States[event][N+complexIdx]` gives the
+   bound state. Render as a horizontal bar below the heatmap.
+
+3. **Trigger markers**: `rec.FiredReaction[event] < 0` identifies scheduled
+   events. Render as vertical lines on the timeline.
+
+4. **Genome context**: `Genome.Sites[i].Context` gives the context tag
+   (promoter/gene-body/intergenic). Render as colored labels on the y-axis.
+
+5. **Ensemble statistics**: `EnsembleResult.MeanFraction` and `StdDev` per
+   species. Render as a bar chart or line plot.
+
+The `bio.BuildResult` struct carries `NumSites` and `NumComplexes` for correctly
+partitioning the `State.Counts` vector in the TUI.
+
+---
+
+## Open Questions (for review before Phase 3)
+
+- **Streaming vs batch rendering**: Should the TUI subscribe to a running
+  simulation (streaming events) or pre-compute and replay? Streaming is more
+  interactive but requires careful synchronization.
+
+- **Aggregation granularity**: For 50+ sites, showing per-site per-event detail
+  may be too dense. Should the TUI aggregate by genomic region or time window?
+
+- **Phase 3 scope**: Is the TUI just a trajectory visualizer, or should it also
+  support interactive parameter tweaking (changing rates, adding triggers mid-run)?

@@ -33,6 +33,12 @@ type EnsembleConfig struct {
 	// ObserveSpecies is the index of the species to compute time-weighted
 	// fraction for in the ensemble result.
 	ObserveSpecies int
+
+	// Schedule is an optional list of deterministic events (sorted by time)
+	// to interleave with stochastic SSA steps. If non-nil and non-empty,
+	// workers call RunWithSchedule() instead of Run().
+	// Phase 1 callers leave this nil for the original behavior.
+	Schedule []ScheduledEvent
 }
 
 // trajectoryResult holds the per-trajectory output sent back on the result channel.
@@ -86,7 +92,12 @@ func RunEnsemble(cfg EnsembleConfig) EnsembleResult {
 				// Using PCG with (seed, 0) — the second parameter is the stream,
 				// which we leave at 0 since each trajectory already has a unique seed.
 				rng := rand.New(rand.NewPCG(cfg.BaseSeed+uint64(trajIdx), 0))
-				rec := Run(cfg.Initial, cfg.Reactions, cfg.TMax, rng)
+				var rec TrajectoryRecord
+				if len(cfg.Schedule) > 0 {
+					rec = RunWithSchedule(cfg.Initial, cfg.Reactions, cfg.Schedule, cfg.TMax, rng)
+				} else {
+					rec = Run(cfg.Initial, cfg.Reactions, cfg.TMax, rng)
+				}
 				frac := TimeWeightedFraction(rec, cfg.ObserveSpecies, cfg.Initial.Counts[cfg.ObserveSpecies], cfg.TMax)
 				results <- trajectoryResult{fraction: frac}
 			}

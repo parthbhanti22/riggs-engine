@@ -186,3 +186,138 @@ func TimeWeightedFraction(rec TrajectoryRecord, speciesIdx int, initialCount int
 
 	return totalWeighted / tMax
 }
+
+// RunWithSchedule executes a complete SSA trajectory with deterministic
+// scheduled events interleaved with stochastic steps (hybrid SSA).
+//
+// At each iteration, the algorithm compares:
+//   - The next stochastic event time (τ, from the SSA step)
+//   - The next scheduled event time
+//
+// Whichever is sooner fires first. If the scheduled event fires, its Deltas
+// are applied with clamping (binary species are clamped to [0,1] to enforce
+// idempotency — a trigger firing while its complex is already bound is a no-op).
+//
+// This is a standard technique for handling deterministic events in SSA
+// simulations (Anderson 2007). It preserves the exactness of the SSA for
+// stochastic channels while correctly interleaving deterministic interventions.
+//
+// The schedule must be sorted by Time in ascending order.
+//
+// Parameters:
+//   - initial: starting state (cloned internally).
+//   - reactions: stochastic reaction channels.
+//   - schedule: deterministic events sorted by time.
+//   - tMax: maximum simulation time.
+//   - rng: seedable PRNG.
+//
+// FiredReaction values in the returned TrajectoryRecord use negative indices
+// for scheduled events: -(tag + 1), where tag is the ScheduledEvent.Tag.
+// This distinguishes them from stochastic reaction indices (which are >= 0).
+func RunWithSchedule(initial State, reactions []Reaction, schedule []ScheduledEvent,
+	tMax float64, rng *rand.Rand) TrajectoryRecord {
+
+	state := initial.Clone()
+	scratch := make([]float64, len(reactions))
+	schedIdx := 0 // pointer into the sorted schedule
+
+	// Pre-allocate record with a reasonable capacity estimate.
+	estEvents := int(tMax*1.5) + len(schedule)
+	if estEvents < 64 {
+		estEvents = 64
+	}
+	rec := TrajectoryRecord{
+		Times:         make([]float64, 0, estEvents),
+		States:        make([][]int, 0, estEvents),
+		FiredReaction: make([]int, 0, estEvents),
+	}
+
+	for state.Time < tMax {
+		// --- Compute next stochastic event ---
+		// We need to know the stochastic τ WITHOUT applying it yet,
+		// so we can compare with the next scheduled event time.
+		a0 := 0.0
+		for i, r := range reactions {
+			scratch[i] = r.Propensity(state.Counts)
+			a0 += scratch[i]
+		}
+
+		var stochTime float64
+		if a0 <= 0 {
+			stochTime = math.Inf(1) // no stochastic events possible
+		} else {
+			r1 := 1.0 - rng.Float64()
+			stochTime = state.Time + (-math.Log(r1) / a0)
+		}
+
+		// --- Check next scheduled event ---
+		var nextSched *ScheduledEvent
+		if schedIdx < len(schedule) {
+			nextSched = &schedule[schedIdx]
+		}
+
+		// --- Determine which fires first ---
+		if nextSched != nil && nextSched.Time <= stochTime && nextSched.Time <= tMax {
+			// Scheduled event fires first.
+			state.Time = nextSched.Time
+
+			// Apply deltas with clamping for binary species.
+			// Clamping prevents counts from going below 0 or above 1 for
+			// binary-state species (methylation, bound state).
+			for s, delta := range nextSched.Deltas {
+				if delta != 0 {
+					newVal := state.Counts[s] + delta
+					if newVal < 0 {
+						newVal = 0
+					} else if newVal > 1 {
+						newVal = 1
+					}
+					state.Counts[s] = newVal
+				}
+			}
+			schedIdx++
+
+			// Record this event with a negative tag to distinguish
+			// from stochastic reactions.
+			if state.Time <= tMax {
+				rec.Times = append(rec.Times, state.Time)
+				snap := make([]int, len(state.Counts))
+				copy(snap, state.Counts)
+				rec.States = append(rec.States, snap)
+				rec.FiredReaction = append(rec.FiredReaction, -(nextSched.Tag + 1))
+			}
+		} else if stochTime <= tMax {
+			// Stochastic event fires first — standard SSA selection.
+			state.Time = stochTime
+
+			// Select which reaction fires.
+			r2 := rng.Float64()
+			target := r2 * a0
+			cum := 0.0
+			fired := len(reactions) - 1
+			for i := range reactions {
+				cum += scratch[i]
+				if cum > target {
+					fired = i
+					break
+				}
+			}
+
+			// Apply deltas.
+			for s, delta := range reactions[fired].Deltas {
+				state.Counts[s] += delta
+			}
+
+			rec.Times = append(rec.Times, state.Time)
+			snap := make([]int, len(state.Counts))
+			copy(snap, state.Counts)
+			rec.States = append(rec.States, snap)
+			rec.FiredReaction = append(rec.FiredReaction, fired)
+		} else {
+			// Both next stochastic and next scheduled are past tMax — done.
+			break
+		}
+	}
+
+	return rec
+}

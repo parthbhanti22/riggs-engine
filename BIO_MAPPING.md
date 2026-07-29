@@ -75,14 +75,131 @@ this with a statistical tolerance of ±0.02 over 5000 trajectories.
 | Pointer / address | dCas9 navigating to target site | Not modeled in Phase 1 |
 | Write-ahead log | Chronological methylation events | `TrajectoryRecord.Times` + `FiredReaction` |
 
-## Phase 2 Preview (do not implement yet)
+## Phase 2: Multi-Site Genome with Targeted Methylation
 
-The following will extend this table when Phase 2 lands:
+Phase 2 extends the single-site toy to a genome with N CpG sites, programmable
+targeting via dCas9 complexes, and environmentally-triggered methylation events.
 
-| Biology | Expected Go Type | Notes |
-|---------|-----------------|-------|
-| Genome (DNA sequence) | `Genome` struct | Fixed sequence, many CpG sites — the "disk" |
-| dCas9 pointer | `Pointer` or `Guide` | Navigates to specific CpG addresses without cutting |
-| Methyltransferase | Reaction generator | Produces `Reaction` values for each targetable CpG |
-| Demethylase | Reaction generator | Same, for erasure |
-| Environmental trigger | TBD | Schema for what the WAL records — open question |
+### Entity Mapping
+
+| Biology | Go Type | Package | Notes |
+|---------|---------|---------|-------|
+| Genome (DNA sequence) | `Genome` struct | `bio` | Ordered, immutable collection of `Site` structs — the "disk" |
+| CpG dinucleotide | `Site` struct | `bio` | Index, coordinate, context tag. Methylation state tracked externally in `State.Counts[site.Index]` |
+| Genomic context | `SiteContext` enum | `bio` | `ContextPromoter`, `ContextGeneBody`, `ContextIntergenic`. Phase 2: metadata only (does not affect rates) |
+| dCas9 pointer | `TargetingComplex` struct | `bio` | Catalytically dead Cas9 + guide RNA targeting one site. Bound state = species in `State.Counts` |
+| Methyltransferase effector | `TargetingComplex.EnhWrite` field | `bio` | Enhanced write rate when bound. Folds into the propensity function, not a separate channel |
+| Demethylase effector | `TargetingComplex.EnhErase` field | `bio` | Enhanced erase rate when bound |
+| Environmental trigger | `EnvironmentalTrigger` struct | `bio` | Deterministic scheduled event that binds a complex at its target site |
+| System builder | `System.Build()` method | `bio` | Maps biology types → `[]gillespie.Reaction` + `gillespie.State` + `[]gillespie.ScheduledEvent` |
+
+### Species Layout in `State.Counts`
+
+```
+Index:    [0]  [1]  [2]  ...  [N-1]   [N]    [N+1]  ...  [N+K-1]
+Species:  m₀   m₁   m₂  ...  mₙ₋₁    b₀     b₁    ...   bₖ₋₁
+          ↑ methylation states ↑       ↑ complex bound states ↑
+          (0=unmethylated, 1=methylated)  (0=unbound, 1=bound)
+```
+
+Where N = number of CpG sites, K = number of targeting complexes.
+
+### Reaction Channel Mapping
+
+| Channel | Count | Deltas | Propensity `a_i(x)` |
+|---------|------:|--------|---------------------|
+| Site write (per site i) | N | `Δ[i] = +1` | `(k_bg_w + Σ{k_enh_w_j · bound_j}) · (1 - meth_i)` |
+| Site erase (per site i) | N | `Δ[i] = -1` | `(k_bg_e + Σ{k_enh_e_j · bound_j}) · meth_i` |
+| Complex unbind (per complex k) | K | `Δ[N+k] = -1` | `k_off · bound_k` |
+| **Total** | **2N + K** | | **O(N + K) — linear scaling** |
+
+The sum `Σ{k_enh_w_j · bound_j}` is over all complexes targeting site i. For
+most sites this is empty (fast path: pure background rate). For targeted sites,
+the closure checks the bound-state species of each complex aimed at that site.
+
+### Propensity Function Design
+
+The propensity for writing at site i demonstrates the "conditional enhancement"
+pattern — the same reaction channel handles both background and enhanced rates:
+
+```go
+// Fast path (no complex targets this site):
+propensity = k_bg_write * (1 - counts[siteIdx])
+
+// Slow path (one or more complexes target this site):
+rate := k_bg_write
+for _, info := range complexesTargetingThisSite {
+    rate += info.enhWriteRate * float64(counts[info.boundSpeciesIdx])
+}
+propensity = rate * (1 - counts[siteIdx])
+```
+
+This is evaluated ~2000 times per SSA step at N=1000 (once per reaction channel).
+The fast path avoids the inner loop entirely for untargeted sites.
+
+### Environmental Trigger: The Write-Ahead Log Mechanic
+
+The EnvironmentalTrigger implements the WAL (write-ahead log) analogy:
+
+1. **Trigger fires** at a scheduled time t (deterministic, not Poisson).
+2. **Complex binds** at its target site: `State.Counts[N + complexIdx] = 1`.
+3. **Enhanced propensity** activates: the bound complex gates higher write/erase
+   rates at the target site via the propensity function.
+4. **Methylation mark** accumulates stochastically while the complex is bound.
+5. **Complex unbinds** stochastically (rate = KOff), ending the enhanced period.
+
+The trigger's occurrence is chronologically recorded in the trajectory event stream
+(FiredReaction = -(tag + 1) for scheduled events). The methylation mark that
+results from the trigger is the biological "WAL entry" — it records that the
+environmental event happened, readable from the methylation state long after the
+trigger and the complex are gone.
+
+**Arrival process assumption**: Environmental triggers use a **fixed external
+schedule** (deterministic times), not a stochastic Poisson process. This models
+a researcher or engineered system applying a stimulus at known times. If the
+trigger fires while the complex is already bound, the event is a no-op (clamped
+to [0,1]).
+
+**Hybrid SSA technique**: Deterministic triggers are interleaved with stochastic
+SSA steps via `RunWithSchedule()`. At each iteration, the next stochastic event
+time τ is compared with the next scheduled event time. Whichever is sooner fires
+first. This preserves SSA exactness for stochastic channels.
+
+### Rate Constants (Default Values)
+
+| Parameter | Value | Biological interpretation |
+|-----------|------:|--------------------------|
+| `k_bg_write` | 0.001 | Spontaneous methylation (rare without enzyme) |
+| `k_bg_erase` | 0.01 | Passive demethylation (replication dilution) |
+| `k_enh_write` | 0.5 | Active methyltransferase (DNMT-like) when bound |
+| `k_enh_erase` | 0.05 | Active demethylase (TET-like) when bound |
+| `k_off` | 0.1 | Complex dissociation (mean residence = 10 time units) |
+
+Background steady-state: `0.001 / (0.001 + 0.01) ≈ 0.091` (9.1% methylated).
+With bound complex: effective write = 0.501, effective erase = 0.06, steady-state ≈ 0.893 (89.3% methylated).
+
+### Biological Analogy Table (Extended)
+
+| Computer Analogy | Biology | Phase 2 Code |
+|-----------------|---------|-------------|
+| ROM / Disk | DNA sequence (immutable) | `Genome` struct with `[]Site` |
+| RAM bit array | Methylation state vector | `State.Counts[0:N]` ∈ {0, 1}ᴺ |
+| Pointer / address | dCas9 guide RNA | `TargetingComplex.TargetSite` → site index |
+| Pointer register | Complex bound state | `State.Counts[N:N+K]` ∈ {0, 1}ᴷ |
+| Write operation | Methyltransferase writes CH₃ | Write reaction channel, enhanced by bound complex |
+| Erase operation | Demethylase removes CH₃ | Erase reaction channel, enhanced by bound complex |
+| WAL entry | Trigger → bind → methylate | `EnvironmentalTrigger` → `ScheduledEvent` → propensity gating |
+| Write-ahead log | Chronological trigger/event stream | `TrajectoryRecord.FiredReaction` (negative = scheduled, positive = stochastic) |
+| Memory bus / data path | Reaction generation pipeline | `System.Build()` → `[]Reaction` + `State` + `[]ScheduledEvent` |
+
+## Phase 3 Preview (do not implement yet)
+
+The following will be needed when Phase 3 (TUI) lands:
+
+| Feature | Expected | Notes |
+|---------|----------|-------|
+| Per-site methylation heatmap | TUI grid: sites × time | Color-coded 0→1 per CpG site |
+| Complex binding timeline | TUI strip | Shows when/where complexes are bound |
+| Trigger markers | TUI annotations | Vertical lines at trigger fire times |
+| Genome context coloring | Site-level tags | Promoter vs gene-body visual distinction |
+| Aggregated statistics | Rolling mean | Ensemble mean + CI for selected sites |
