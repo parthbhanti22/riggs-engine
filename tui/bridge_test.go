@@ -165,7 +165,7 @@ func makeTestSystem() (*bio.System, bio.BuildResult) {
 
 func TestSimRunner_StartAndStop(t *testing.T) {
 	sys, result := makeTestSystem()
-	runner := NewSimRunner(result, sys.Genome, 100.0, 42)
+	runner := NewSimRunner(result, sys.Genome, sys.Complexes, 100.0, 42)
 	runner.Start()
 
 	// Wait briefly for some events to fire
@@ -186,7 +186,10 @@ func TestSimRunner_StartAndStop(t *testing.T) {
 
 func TestSimRunner_PauseResume(t *testing.T) {
 	sys, result := makeTestSystem()
-	runner := NewSimRunner(result, sys.Genome, 1000.0, 42)
+	// Use very large tMax so the simulation is definitely still running
+	// during the pause/resume window (with these rates, tMax=1000 completes
+	// in ~1ms — far too fast for the test's timing windows).
+	runner := NewSimRunner(result, sys.Genome, sys.Complexes, 1e9, 42)
 	runner.Start()
 
 	// Let it run briefly
@@ -214,7 +217,7 @@ func TestSimRunner_PauseResume(t *testing.T) {
 
 	// Resume
 	runner.TogglePause()
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 
 	var snap3 SimSnapshot
 	runner.ReadSnapshot(&snap3)
@@ -228,7 +231,7 @@ func TestSimRunner_PauseResume(t *testing.T) {
 
 func TestSimRunner_StepOnce(t *testing.T) {
 	sys, result := makeTestSystem()
-	runner := NewSimRunner(result, sys.Genome, 1000.0, 42)
+	runner := NewSimRunner(result, sys.Genome, sys.Complexes, 1000.0, 42)
 
 	// Start paused
 	runner.Start()
@@ -276,7 +279,7 @@ func TestSimRunner_MethFracsExact(t *testing.T) {
 	siteFracSum := make([]float64, 5)
 
 	for run := 0; run < nRuns; run++ {
-		runner := NewSimRunner(result, g, tMax, uint64(run))
+		runner := NewSimRunner(result, g, nil, tMax, uint64(run))
 		runner.Start()
 
 		// Wait for completion
@@ -306,7 +309,7 @@ func TestSimRunner_MethFracsExact(t *testing.T) {
 
 func TestSimRunner_WALPopulated(t *testing.T) {
 	sys, result := makeTestSystem()
-	runner := NewSimRunner(result, sys.Genome, 100.0, 42)
+	runner := NewSimRunner(result, sys.Genome, sys.Complexes, 100.0, 42)
 	runner.Start()
 
 	time.Sleep(50 * time.Millisecond)
@@ -337,7 +340,7 @@ func TestSimRunner_ScheduledEventsInterleaved(t *testing.T) {
 	// negative FiredReaction values.
 	sys, result := makeTestSystem()
 	// Trigger fires at t=10.0 and t=50.0
-	runner := NewSimRunner(result, sys.Genome, 100.0, 42)
+	runner := NewSimRunner(result, sys.Genome, sys.Complexes, 100.0, 42)
 	runner.Start()
 
 	// Wait for simulation to complete

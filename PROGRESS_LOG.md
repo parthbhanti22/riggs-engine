@@ -450,14 +450,136 @@ partitioning the `State.Counts` vector in the TUI.
 
 ---
 
-## Open Questions (for review before Phase 3)
+## Open Questions — RESOLVED (Phase 3)
 
-- **Streaming vs batch rendering**: Should the TUI subscribe to a running
-  simulation (streaming events) or pre-compute and replay? Streaming is more
-  interactive but requires careful synchronization.
+These questions from Phase 2 were resolved at the start of Phase 3:
 
-- **Aggregation granularity**: For 50+ sites, showing per-site per-event detail
-  may be too dense. Should the TUI aggregate by genomic region or time window?
+1. **Streaming vs batch rendering**: → Streaming via tick-driven coalescing.
+   The simulation goroutine writes to a shared `SimSnapshot` behind a mutex.
+   The TUI reads it at 10 FPS via `tea.Tick`. No individual events are pushed.
 
-- **Phase 3 scope**: Is the TUI just a trajectory visualizer, or should it also
-  support interactive parameter tweaking (changing rates, adding triggers mid-run)?
+2. **Aggregation granularity**: → Per-site bitmap at 50 sites fits in 80
+   columns. The stats panel shows selected-site detail via arrow keys. No
+   region aggregation needed at current scale.
+
+3. **Phase 3 scope**: → Visualizer + interactive controls (pause/resume,
+   step-forward, per-site inspection). No parameter tweaking in Phase 3.
+
+---
+
+## Entry 6: Phase 3 — TUI Dashboard (2026-08-06)
+
+### What was built
+
+The `tui` package bridges the Phase 2 simulation output to a Bubble Tea
+terminal dashboard. Total new code: ~1050 lines of Go in 4 files, plus CLI
+updates.
+
+**New package: `tui/`**
+
+| File | Lines | Purpose |
+|------|------:|---------|
+| `bridge.go` | ~465 | SimRunner, SimSnapshot, RingBuffer, WALEntry, hybrid-SSA loop |
+| `model.go` | ~270 | Bubble Tea Model (Init/Update/View), keybinding dispatch |
+| `views.go` | ~280 | renderMemoryMap, renderWALTail, renderStats |
+| `bridge_test.go` | ~370 | 12 tests: ring buffer, snapshot, lifecycle, statistics |
+
+**CLI update**
+
+| File | Change |
+|------|--------|
+| `cmd/riggs/main.go` | Added `-mode tui`, `runTUI()` with ensemble pre-computation |
+
+### Design decisions
+
+**Tick-driven coalescing**: The simulation goroutine fires thousands of events
+per second. Individual events are never sent to the TUI. Instead, the goroutine
+writes to a shared `SimSnapshot` behind a `sync.Mutex` after every SSA step.
+The Bubble Tea loop reads the snapshot every 100ms (10 FPS tick). This coalesces
+hundreds of events into a single render frame with zero channel backpressure.
+
+**Exact running integrator**: Per-site methylation fractions are maintained by a
+running integrator in the simulation goroutine: `Σ(state × dt) / elapsed`. The
+TUI reads the result directly — it never computes its own averages. This ensures
+aggregate statistics remain exact even though the WAL tail view is bounded.
+
+**Ring buffer (256 entries, 8KB)**: The WAL tail uses a fixed-size `[256]WALEntry`
+array. At 10K+ events/sec, an unbounded slice would consume megabytes per second.
+The ring buffer stores ~5 seconds of history — more than enough for the scrolling
+`tail -f` display.
+
+**No changes to `gillespie/` or `bio/`**: The TUI's `SimRunner.doOneStep()` inlines
+the hybrid-SSA interleaving logic, using the existing `Step()` propensity computation
+directly. Phase 1 and Phase 2 packages are completely unchanged.
+
+### TUI components
+
+1. **Header**: Status (RUNNING/PAUSED/DONE), simulation clock, event count.
+
+2. **Genome Memory Map**: Horizontal bitmap strip. Each CpG site is one character
+   cell. `█` = methylated (green), `░` = unmethylated (dark). Context row shows
+   `P` (promoter, amber) / `G` (gene-body, indigo). Binding row shows `◆` (red)
+   at the target site when a complex is bound.
+
+3. **WAL Tail**: Scrolling `tail -f` style log of recent events. `WRITE site[0] 0→1`,
+   `ERASE site[3] 1→0`, `*TRIGGER bind[0]`, `UNBIND cplx[0]`. Newest at bottom.
+
+4. **Stats Panel**: Selected-site detail (current state, time-weighted methylation
+   fraction with bar chart, ensemble reference), complex bound/unbound status.
+
+5. **Help Bar**: Keybinding reference.
+
+### Keybindings
+
+| Key | Action |
+|-----|--------|
+| Space | Toggle pause/resume |
+| N | Step one event (when paused) |
+| ←/→ | Select site for inspection |
+| Q | Quit |
+
+### Test results
+
+All **34 tests** pass across all packages:
+
+| Package | Tests | Time |
+|---------|------:|-----:|
+| gillespie | 10 | 1.0s |
+| bio | 12 | 1.5s |
+| tui | 12 | 0.8s |
+| **Total** | **34** | **3.3s** |
+
+TUI bridge tests validate:
+- Ring buffer push, overflow, wrap-around, chronological ordering, tail
+- SimSnapshot deep copy independence
+- SimRunner start/stop lifecycle
+- Pause/resume state transitions (with large tMax to avoid completion race)
+- Step-once precision (exactly +1 event per call)
+- MethFracs convergence to analytical CTMC steady-state (20 runs × 2000 sim time)
+- WAL population and chronological ordering
+- Scheduled event interleaving (trigger tags in WAL)
+
+### How to run
+
+```bash
+# Interactive dashboard (default 50 sites, tMax=1000)
+go run ./cmd/riggs/ -mode tui
+
+# With custom parameters
+go run ./cmd/riggs/ -mode tui -sites 30 -tmax 500 -seed 123
+```
+
+---
+
+## Open Questions (for review before Phase 4)
+
+- **Distributed architecture**: Should Phase 4 distribute at the trajectory
+  level (each worker node runs independent trajectories and sends scalars back)
+  or at the site level (partition the genome across nodes)?
+
+- **TUI enhancements**: Should we add real-time plotting (sparklines) of
+  per-site methylation over simulation time? The ring buffer already stores
+  the data; it's a rendering question.
+
+- **Parameter tweaking**: Should Phase 4 include interactive parameter
+  modification (changing rates mid-run, adding/removing complexes)?

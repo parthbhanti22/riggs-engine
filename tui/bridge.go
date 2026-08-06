@@ -123,6 +123,10 @@ type SimSnapshot struct {
 
 	// NumComplexes is the number of targeting complexes.
 	NumComplexes int
+
+	// ComplexTargets maps complex index → target site index.
+	// Used by the TUI to render binding indicators on the correct site.
+	ComplexTargets []int
 }
 
 // CopyTo performs a deep copy of the snapshot into dst.
@@ -146,6 +150,9 @@ func (s *SimSnapshot) CopyTo(dst *SimSnapshot) {
 		dst.MethFracs = make([]float64, len(s.MethFracs))
 	}
 	copy(dst.MethFracs, s.MethFracs)
+
+	// ComplexTargets is immutable — shallow copy is fine
+	dst.ComplexTargets = s.ComplexTargets
 }
 
 // SimRunner owns the simulation goroutine and the shared snapshot.
@@ -181,7 +188,8 @@ type SimRunner struct {
 }
 
 // NewSimRunner creates a SimRunner from a bio.System build result.
-func NewSimRunner(buildResult bio.BuildResult, genome *bio.Genome, tMax float64, seed uint64) *SimRunner {
+// The complexes parameter provides target-site mappings for the TUI binding row.
+func NewSimRunner(buildResult bio.BuildResult, genome *bio.Genome, complexes []bio.TargetingComplex, tMax float64, seed uint64) *SimRunner {
 	r := &SimRunner{
 		reactions: buildResult.Reactions,
 		schedule:  buildResult.Schedule,
@@ -200,12 +208,19 @@ func NewSimRunner(buildResult bio.BuildResult, genome *bio.Genome, tMax float64,
 	}
 	r.pauseCnd = sync.NewCond(&r.pauseMu)
 
+	// Build complex target mapping
+	targets := make([]int, len(complexes))
+	for i, c := range complexes {
+		targets[i] = c.TargetSite
+	}
+
 	// Initialize snapshot
 	r.snapshot.Counts = make([]int, len(r.state.Counts))
 	copy(r.snapshot.Counts, r.state.Counts)
 	r.snapshot.MethFracs = make([]float64, buildResult.NumSites)
 	r.snapshot.NumSites = buildResult.NumSites
 	r.snapshot.NumComplexes = buildResult.NumComplexes
+	r.snapshot.ComplexTargets = targets
 
 	return r
 }

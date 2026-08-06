@@ -4,10 +4,11 @@
 // Phase 1 mode (toy): single CpG site, two-state CTMC.
 // Phase 2 mode (genome): multi-site genome with targeted methylation via
 // dCas9 complexes and environmental triggers.
+// Phase 3 mode (tui): interactive Bubble Tea dashboard with live simulation.
 //
 // Usage:
 //
-//	riggs [-mode toy|genome] [-trajectories N] [-tmax T] [-seed S] [-workers W]
+//	riggs [-mode toy|genome|tui] [-trajectories N] [-tmax T] [-seed S] [-workers W]
 //	      [-sites N] [-kw rate] [-ke rate]
 package main
 
@@ -18,13 +19,16 @@ import (
 	"runtime"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/pxrth9/riggs/bio"
 	"github.com/pxrth9/riggs/gillespie"
+	riggstui "github.com/pxrth9/riggs/tui"
 )
 
 func main() {
 	// --- CLI flags ---
-	mode := flag.String("mode", "genome", "simulation mode: 'toy' (Phase 1 single-site) or 'genome' (Phase 2 multi-site)")
+	mode := flag.String("mode", "genome", "simulation mode: 'toy' (Phase 1), 'genome' (Phase 2), or 'tui' (Phase 3 dashboard)")
 	trajectories := flag.Int("trajectories", 1000, "number of independent trajectories")
 	tMax := flag.Float64("tmax", 1000.0, "maximum simulation time per trajectory")
 	kWrite := flag.Float64("kw", 0.3, "methyltransferase rate constant (toy mode only)")
@@ -39,8 +43,10 @@ func main() {
 		runToy(*trajectories, *tMax, *kWrite, *kErase, *seed, *workers)
 	case "genome":
 		runGenome(*trajectories, *tMax, *seed, *workers, *nSites)
+	case "tui":
+		runTUI(*tMax, *seed, *workers, *nSites)
 	default:
-		fmt.Fprintf(os.Stderr, "error: unknown mode %q (use 'toy' or 'genome')\n", *mode)
+		fmt.Fprintf(os.Stderr, "error: unknown mode %q (use 'toy', 'genome', or 'tui')\n", *mode)
 		os.Exit(1)
 	}
 }
@@ -220,6 +226,79 @@ func runGenome(trajectories int, tMax float64, seed uint64, workers, nSites int)
 		fmt.Printf("  ✓ Targeted site shows %.1fx enhancement — PASS\n", ratio)
 	} else {
 		fmt.Printf("  ✗ Enhancement ratio %.2f too low (expected >2x) — FAIL\n", ratio)
+		os.Exit(1)
+	}
+}
+
+// runTUI launches the Phase 3 interactive Bubble Tea dashboard.
+func runTUI(tMax float64, seed uint64, workers, nSites int) {
+	if nSites <= 0 {
+		fmt.Fprintf(os.Stderr, "error: site count must be positive (%d)\n", nSites)
+		os.Exit(1)
+	}
+
+	// --- Build genome system (same as genome mode) ---
+	g := bio.NewGenome(nSites, 100, []bio.SiteContext{bio.ContextPromoter, bio.ContextGeneBody})
+
+	complexes := []bio.TargetingComplex{
+		{
+			Index:      0,
+			TargetSite: 0,
+			KOff:       0.1,
+			EnhWrite:   0.5,
+			EnhErase:   0.05,
+		},
+	}
+
+	triggerTimes := make([]float64, 0)
+	for t := 0.0; t < tMax; t += 50.0 {
+		triggerTimes = append(triggerTimes, t)
+	}
+	triggers := []bio.EnvironmentalTrigger{
+		{
+			Name:       "periodic_signal",
+			ComplexIdx: 0,
+			FireTimes:  triggerTimes,
+		},
+	}
+
+	sys := &bio.System{
+		Genome:    g,
+		Complexes: complexes,
+		Triggers:  triggers,
+		KBgWrite:  0.001,
+		KBgErase:  0.01,
+	}
+	buildResult := sys.Build()
+
+	// --- Pre-compute ensemble reference stats ---
+	// Run a quick ensemble to provide reference statistics in the dashboard.
+	ensembleN := 200
+	ensembleMean := make([]float64, nSites)
+	ensembleStd := make([]float64, nSites)
+	for site := 0; site < nSites && site < 2; site++ {
+		result := gillespie.RunEnsemble(gillespie.EnsembleConfig{
+			Initial:         buildResult.InitialState,
+			Reactions:       buildResult.Reactions,
+			TMax:            tMax,
+			NumTrajectories: ensembleN,
+			Workers:         workers,
+			BaseSeed:        seed + 1000,
+			ObserveSpecies:  site,
+			Schedule:        buildResult.Schedule,
+		})
+		ensembleMean[site] = result.MeanFraction
+		ensembleStd[site] = result.StdDev
+	}
+
+	// --- Launch TUI ---
+	runner := riggstui.NewSimRunner(buildResult, g, complexes, tMax, seed)
+	model := riggstui.NewModel(runner, g)
+	model.SetEnsembleStats(ensembleMean, ensembleStd, ensembleN)
+
+	p := tea.NewProgram(model, tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "error running TUI: %v\n", err)
 		os.Exit(1)
 	}
 }

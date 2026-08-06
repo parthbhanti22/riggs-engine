@@ -1,8 +1,8 @@
 # Riggs Engine — Architecture
 
-> **Status**: Phase 2 (Biological Instruction Set) — complete.
+> **Status**: Phase 3 (TUI Dashboard) — complete.
 > This document describes the system as it currently exists, not as planned.
-> Updated: 2026-07-29
+> Updated: 2026-08-06
 
 ## Overview
 
@@ -16,8 +16,8 @@ methylation state vector changes.
 
 ```
 Phase 4: Distributed Workers (gRPC + failure detector)   [not started]
-Phase 3: TUI (Bubble Tea dashboard)                      [not started]
-Phase 2: Biological Instruction Set                      [<-- COMPLETE]
+Phase 3: TUI (Bubble Tea dashboard)                      [<-- COMPLETE]
+Phase 2: Biological Instruction Set                      [COMPLETE]
 Phase 1: Gillespie SSA Core                              [COMPLETE]
 ```
 
@@ -30,10 +30,24 @@ as a general-purpose stochastic reaction simulator. It knows nothing about biolo
 types. The core pattern is **reaction generation**: `System.Build()` produces
 `[]Reaction` + `State` + `[]ScheduledEvent` values that the Phase 1 engine simulates.
 
+**Phase 3** provides real-time visualization. The `tui` package bridges the simulation
+goroutine to a Bubble Tea terminal dashboard via tick-driven coalescing. The simulation
+runs at thousands of events/sec; the TUI reads a coalesced snapshot at 10 FPS.
+
 ## Package Architecture
 
 ```
-cmd/riggs/main.go          Presentation Tier — CLI entrypoint
+cmd/riggs/main.go          Presentation Tier — CLI + TUI entrypoint
+        │
+        ├──→ (genome/toy)     Direct ensemble runner output
+        │
+        └──→ (tui)            Bubble Tea program
+                │
+                ▼
+tui/                        Visualization Tier — terminal dashboard
+  bridge.go                   SimRunner, SimSnapshot, RingBuffer, WALEntry
+  model.go                    Bubble Tea Model (Init/Update/View)
+  views.go                    renderMemoryMap, renderWALTail, renderStats
         │
         ▼
 bio/                        Logic Tier — biology-specific types
@@ -153,15 +167,74 @@ Ensemble simulation uses a fixed-size worker pool (default: `GOMAXPROCS`) consum
 trajectory jobs from a channel. Prevents unbounded goroutine spawn and controls
 memory footprint to `O(workers)`, not `O(trajectories)`.
 
+## Phase 3 Components
+
+### Package: `tui`
+
+Terminal dashboard bridging the simulation to Bubble Tea.
+
+| File | Responsibility |
+|------|---------------|
+| `bridge.go` | `SimRunner` (simulation goroutine), `SimSnapshot` (shared state), `RingBuffer` (bounded WAL history), `WALEntry` |
+| `model.go` | Bubble Tea `Model` with `Init`/`Update`/`View`, 10 FPS tick, keybinding dispatch |
+| `views.go` | `renderMemoryMap` (genome bitmap), `renderWALTail` (scrolling log), `renderStats` (per-site bars + ensemble reference) |
+| `bridge_test.go` | 12 tests: ring buffer correctness, snapshot deep copy, pause/resume/step-once lifecycle, statistical MethFracs validation, WAL population, scheduled event interleaving |
+
+### Phase 3 Design Decisions
+
+#### Tick-driven coalescing (not push-driven)
+
+The simulation fires thousands of events/sec. The TUI renders at 10 FPS. The
+bridge uses **tick-driven coalescing**: the simulation goroutine writes to a shared
+`SimSnapshot` behind a `sync.Mutex` after every SSA step. The Bubble Tea event
+loop reads the snapshot every 100ms (10 FPS tick). Between ticks, all intermediate
+states are coalesced — the TUI only sees the latest state.
+
+Why not push individual events as `tea.Msg`? Because:
+- The Bubble Tea message queue would grow unboundedly at 10K+ events/sec.
+- The terminal can't usefully render faster than ~30 FPS anyway.
+- Coalescing is correct because the memory-map view shows *current* state, not history.
+
+#### Backpressure policy
+
+| Data | Policy | Rationale |
+|------|--------|-----------|
+| `State.Counts` | Last-writer-wins | TUI always sees latest state; intermediate states don't matter for the bitmap |
+| Sim time, event count | Last-writer-wins | Monotonically increasing; latest is always correct |
+| WAL tail | Ring buffer (256 entries, 8KB) | Fixed RAM bound; view only shows most recent events |
+| Per-site methylation fractions | Running integrator (exact) | Simulation goroutine maintains Σ(state × dt) / elapsed; TUI reads the result directly |
+
+The key invariant: **aggregate statistics (MethFracs) are always exact**, even though
+the event log view is bounded. The running integrator accumulates (state × duration)
+at every SSA step — no events are ever skipped for the integrator, only for the
+ring buffer display.
+
+#### Ring buffer for WAL tail
+
+The WAL tail view uses a fixed-size `[256]WALEntry` array (not a slice). When full,
+the oldest entry is overwritten. This is a hard RAM constraint — with event rates of
+10K+/sec, an unbounded slice would consume megabytes per second. The 256-entry buffer
+stores ~5 seconds of history at typical event rates, which is more than enough for
+the scrolling `tail -f` view.
+
+#### SimRunner owns the hybrid-SSA loop
+
+The `tui` package inlines the hybrid-SSA interleaving logic (stochastic τ vs. next
+scheduled event time) in its own `SimRunner.doOneStep()`. This avoids modifying the
+`gillespie/` package — it uses the existing `Step()` propensity computation directly.
+The `gillespie/` and `bio/` packages remain completely unchanged in Phase 3.
+
 ## Dependencies
 
-Go standard library only — **zero external dependencies**.
+The `gillespie/` and `bio/` packages use Go standard library only — **zero external
+dependencies**. The `tui/` and `cmd/riggs/` packages add Charm libraries for the TUI.
 
-| stdlib package | Usage |
-|---------------|-------|
-| `math` | `Log`, `Inf`, `Sqrt` |
-| `math/rand/v2` | Per-trajectory seedable PRNG (PCG) |
-| `sync` | `WaitGroup` for worker pool |
+| Package | Usage |
+|---------|-------|
+| `math`, `math/rand/v2` | SSA numerics, seedable PRNG (PCG) |
+| `sync` | `WaitGroup`, `Mutex`, `Cond` for worker pool and TUI bridge |
 | `runtime` | `GOMAXPROCS` for default pool size |
 | `sort` | Sorting scheduled events by time |
 | `fmt`, `flag`, `os`, `time` | CLI argument parsing, output, process control |
+| `github.com/charmbracelet/bubbletea` | TUI framework (Phase 3 only) |
+| `github.com/charmbracelet/lipgloss` | Terminal styling (Phase 3 only) |
